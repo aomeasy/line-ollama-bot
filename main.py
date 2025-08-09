@@ -1,3 +1,16 @@
+import os, requests
+from fastapi import FastAPI, Request, HTTPException
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+
+app = FastAPI()  # << สำคัญ: ชื่อแปรต้องเป็น app
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
 def ask_llm(prompt: str) -> str:
     """
     เรียก Hugging Face Inference API (ฟรี) ของโมเดลโอเพนซอร์ส
@@ -52,3 +65,4 @@ def ask_llm(prompt: str) -> str:
         return f"เรียก HF ล้มเหลว: {e}"
     except Exception as e:
         return f"ข้อผิดพลาดไม่คาดคิด: {e}"
+
