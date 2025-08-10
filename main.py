@@ -1,6 +1,4 @@
-import os
-import json
-import requests
+import os, json, requests
 from threading import Thread
 from typing import List, Optional, Tuple
 
@@ -12,239 +10,196 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# ----- load .env (สะดวกเวลา dev) -----
 load_dotenv()
-
 app = FastAPI()
 
-# ====== ENV & GLOBALS ======
+# ---------- LINE ENV ----------
 LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
 LINE_CHANNEL_SECRET = (os.getenv("LINE_CHANNEL_SECRET") or "").strip()
 
-# ใส่ได้ 2 แบบ:
-#   1) HF_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-#   2) HF_MODELS="Qwen/Qwen2.5-1.5B-Instruct, Qwen/Qwen2.5-3B-Instruct, HuggingFaceH4/zephyr-7b-beta"
+# ---------- HF ENV ----------
 HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
 HF_MODEL = (os.getenv("HF_MODEL") or "Qwen/Qwen2.5-1.5B-Instruct").strip()
 HF_MODELS = (os.getenv("HF_MODELS") or "").strip()
 
-# default/fallback list (แก้เรียงลำดับตามชอบได้)
-DEFAULT_FALLBACK_MODELS: List[str] = [
-    HF_MODEL,
-    "Qwen/Qwen2.5-3B-Instruct",
-    "HuggingFaceH4/zephyr-7b-beta",
-    "microsoft/DialoGPT-medium",
-    "gpt2",  # โมเดลเล็ก ไว้เช็คระบบ (คุณภาพตอบไม่ดีนัก)
-]
+# ---------- OLLAMA ENV ----------
+# ตัวอย่าง: OLLAMA_BASE_URL="http://127.0.0.1:11434"
+OLLAMA_BASE_URL = (os.getenv("OLLAMA_BASE_URL") or "").strip().rstrip("/")
+# ตัวอย่าง: OLLAMA_MODEL="qwen2.5:3b" หรือ "llama3.1:8b-instruct"
+OLLAMA_MODEL = (os.getenv("OLLAMA_MODEL") or "llama3.1:8b-instruct").strip()
 
-MAX_LINE_CHARS = 5000  # กันข้อความยาวเกินลิมิตของ LINE
+MAX_LINE_CHARS = 5000
 
 line_bot_api: Optional[LineBotApi] = None
 handler: Optional[WebhookHandler] = None
 
-# จำโมเดลที่ใช้งานได้ล่าสุด เพื่อลดการลองหลายรอบทุกครั้ง
-ACTIVE_MODEL: Optional[str] = None
+# จำโมเดล HF ที่เวิร์คล่าสุด เพื่อลดการลองซ้ำ
+ACTIVE_HF_MODEL: Optional[str] = None
 
-
-# ====== UTILITIES ======
-def parse_model_list() -> List[str]:
-    """
-    รวมรายการโมเดลจาก HF_MODELS (comma-separated) + DEFAULT_FALLBACK_MODELS
-    และลบซ้ำ/trim
-    """
-    models = []
-    if HF_MODELS:
-        for m in HF_MODELS.split(","):
-            s = m.strip()
-            if s:
-                models.append(s)
-    # ต่อด้วยชุด default
-    models.extend(DEFAULT_FALLBACK_MODELS)
-
-    # unique ตามลำดับแรกพบ
-    seen = set()
-    uniq = []
+# ===== Helpers =====
+def parse_hf_models() -> List[str]:
+    default = [
+        HF_MODEL,
+        "Qwen/Qwen2.5-3B-Instruct",
+        "HuggingFaceH4/zephyr-7b-beta",
+        "microsoft/DialoGPT-medium",
+        "gpt2",
+    ]
+    given = [m.strip() for m in HF_MODELS.split(",") if m.strip()]
+    models = given + default
+    uniq, seen = [], set()
     for m in models:
         if m not in seen:
-            uniq.append(m)
-            seen.add(m)
+            uniq.append(m); seen.add(m)
     return uniq
 
-
 def hf_call(model: str, prompt: str) -> Tuple[bool, str, int]:
-    """
-    เรียก HF Inference API ที่โมเดลระบุ
-    return: (ok, text_or_error, status_code)
-    """
     if not HF_TOKEN:
         return False, "HF_TOKEN not set", 0
-
     url = f"https://api-inference.huggingface.co/models/{model}"
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
         "Content-Type": "application/json",
     }
     payload = {"inputs": prompt, "options": {"wait_for_model": True}}
-
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        status = resp.status_code
-
-        # เคส 404/503: ถือว่า model ใช้ไม่ได้ตอนนี้ → ให้ fallback
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        status = r.status_code
         if status in (404, 503):
-            # แนบข้อความสั้นๆ ไว้ debug
+            # 404/503 → ข้ามไปลองตัวถัดไป
             try:
-                data = resp.json()
+                data = r.json()
             except Exception:
-                data = {"raw": resp.text[:300]}
+                data = {"raw": r.text[:300]}
             return False, f"HF {status} on {model}: {json.dumps(data)[:300]}", status
+        if not (200 <= status < 300):
+            return False, f"HF {status} on {model}: {r.text[:300]}", status
 
-        # อื่นๆ ถ้าไม่ 2xx → เป็น error
-        if status < 200 or status >= 300:
-            return False, f"HF {status} on {model}: {resp.text[:300]}", status
-
-        # Parse ผลลัพธ์
-        data = resp.json()
-        # รูปแบบที่พบบ่อย
+        data = r.json()
+        # เคสยอดฮิต: list[{generated_text: ...}]
         if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and "generated_text" in item:
-                    text = str(item["generated_text"])[:MAX_LINE_CHARS]
-                    return True, text, status
-
+            for it in data:
+                if isinstance(it, dict) and "generated_text" in it:
+                    return True, str(it["generated_text"])[:MAX_LINE_CHARS], status
         if isinstance(data, dict) and "generated_text" in data:
-            text = str(data["generated_text"])[:MAX_LINE_CHARS]
-            return True, text, status
-
-        # fallback: แสดงดิบ (ตัดความยาว)
-        txt = json.dumps(data, ensure_ascii=False)[:MAX_LINE_CHARS]
-        return True, txt, status
-
+            return True, str(data["generated_text"])[:MAX_LINE_CHARS], status
+        return True, json.dumps(data, ensure_ascii=False)[:MAX_LINE_CHARS], status
     except Exception as e:
         return False, f"HF exception on {model}: {e}", 0
 
+def ollama_call(prompt: str) -> Tuple[bool, str]:
+    if not OLLAMA_BASE_URL or not OLLAMA_MODEL:
+        return False, "Ollama not configured"
+    try:
+        # ใช้ endpoint /api/chat (แนะนำสำหรับโมเดลสไตล์ instruct)
+        url = f"{OLLAMA_BASE_URL}/api/chat"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        r = requests.post(url, json=payload, timeout=60)
+        if not r.ok:
+            return False, f"Ollama {r.status_code}: {r.text[:300]}"
+        data = r.json()
+        # โครงสร้างมาตรฐานของ Ollama
+        content = (data.get("message") or {}).get("content") or ""
+        if not content:
+            # เผื่อบางรุ่นคืนรูปแบบอื่น
+            content = json.dumps(data, ensure_ascii=False)
+        return True, content[:MAX_LINE_CHARS]
+    except Exception as e:
+        return False, f"Ollama exception: {e}"
 
-def ask_llm_with_fallback(prompt: str) -> str:
-    """
-    ลองเรียกตามลำดับ:
-      1) ACTIVE_MODEL (ถ้ามี)
-      2) รายการ model จาก parse_model_list()
-    เก็บ ACTIVE_MODEL ใหม่เมื่อสำเร็จ
-    """
-    global ACTIVE_MODEL
+def ask_llm(prompt: str) -> str:
+    """ลำดับการลอง: HF (active→fallback list) → Ollama"""
+    global ACTIVE_HF_MODEL
+    tried_msgs = []
 
-    tried_msgs: List[str] = []
+    # 1) HF active
+    if ACTIVE_HF_MODEL:
+        ok, text, _ = hf_call(ACTIVE_HF_MODEL, prompt)
+        if ok: return text
+        tried_msgs.append(text)
 
-    # 1) ถ้ามีโมเดลที่เคยสำเร็จล่าสุด ให้ลองก่อน
-    if ACTIVE_MODEL:
-        ok, text, status = hf_call(ACTIVE_MODEL, prompt)
-        if ok:
-            return text
-        tried_msgs.append(text)  # เก็บไว้ debug ถ้าไม่สำเร็จ
-
-    # 2) ลองชุด fallback ทีละตัว
-    for model in parse_model_list():
-        # ถ้าเท่ากับ ACTIVE_MODEL ที่เพิ่งลองแล้วข้าม
-        if ACTIVE_MODEL and model == ACTIVE_MODEL:
+    # 2) HF fallback list
+    for m in parse_hf_models():
+        if ACTIVE_HF_MODEL and m == ACTIVE_HF_MODEL:
             continue
-        ok, text, status = hf_call(model, prompt)
+        ok, text, _ = hf_call(m, prompt)
         if ok:
-            ACTIVE_MODEL = model  # จำตัวที่เวิร์ค
+            ACTIVE_HF_MODEL = m
             return text
         tried_msgs.append(text)
 
-    # ถ้าไม่สำเร็จทั้งหมด
-    joined = "\n".join(tried_msgs[-3:])  # แนบ error ล่าสุดสั้นๆ
-    return f"(HF) ไม่สามารถเรียกใช้งานโมเดลใดๆ ได้ในตอนนี้\n{joined}"
+    # 3) Ollama
+    ok, text = ollama_call(prompt)
+    if ok:
+        return text
+    tried_msgs.append(text)
 
+    return "(LLM) ไม่สามารถเรียกใช้งานผู้ให้บริการใดได้ตอนนี้\n" + "\n".join(tried_msgs[-3:])
 
 def get_target_id(event) -> Optional[str]:
-    """
-    คืน user_id / group_id / room_id อันใดอันหนึ่งสำหรับ push_message
-    (ต้องเปิดสิทธิ์ Push ใน LINE Console ด้วย)
-    """
     src = event.source
-    for attr in ("user_id", "group_id", "room_id"):
-        val = getattr(src, attr, None)
-        if val:
-            return val
+    for k in ("user_id", "group_id", "room_id"):
+        v = getattr(src, k, None)
+        if v: return v
     return None
 
-
-# ====== FASTAPI LIFECYCLE ======
+# ===== FastAPI lifecycle =====
 @app.on_event("startup")
 def on_startup():
     global line_bot_api, handler
-
     if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-        print("⚠️  Missing LINE env: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
+        print("⚠️ Missing LINE env")
     else:
         line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-        # ผูก handler แบบ dynamic (หลีกเลี่ยง @handler.add ตอน handler ยังเป็น None)
         handler.add(MessageEvent, message=TextMessage)(handle_message)
 
-    if not HF_TOKEN:
-        print("⚠️  HF_TOKEN is not set; LLM calls will fail")
-
-    # เตรียม ACTIVE_MODEL ถ้าอยาก warm-up (optional)
-    # try:
-    #     txt = ask_llm_with_fallback("ping")
-    #     print("Warm-up LLM ok")
-    # except Exception as e:
-    #     print("Warm-up failed:", e)
-
-
-# ====== ROUTES ======
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "active_model": ACTIVE_MODEL}
-
+    return {
+        "ok": True,
+        "active_hf_model": ACTIVE_HF_MODEL,
+        "ollama": bool(OLLAMA_BASE_URL),
+    }
 
 @app.get("/hfcheck")
 def hfcheck():
-    """
-    เช็คสถานะหลายโมเดลในคราวเดียว
-    """
-    results = []
-    for model in parse_model_list():
-        ok, text, status = hf_call(model, "ping")
-        results.append(
-            {"model": model, "ok": ok, "status": status, "sample": text[:200]}
-        )
-    return {"results": results, "active_model": ACTIVE_MODEL}
+    res = []
+    for m in parse_hf_models():
+        ok, text, status = hf_call(m, "ping")
+        res.append({"model": m, "ok": ok, "status": status, "sample": text[:160]})
+    return {"results": res, "active_hf_model": ACTIVE_HF_MODEL}
 
+@app.get("/ollamacheck")
+def ollamacheck():
+    ok, text = ollama_call("ping")
+    return {"ok": ok, "sample": text[:160], "model": OLLAMA_MODEL, "base": OLLAMA_BASE_URL}
 
 @app.get("/")
 def root():
-    return {"msg": "LINE + HF AI bot is running", "active_model": ACTIVE_MODEL}
-
+    return {"msg": "LINE + AI bot is running", "active_hf_model": ACTIVE_HF_MODEL}
 
 @app.post("/callback")
 async def callback(request: Request):
     if handler is None:
         raise HTTPException(status_code=500, detail="LINE handler not initialized")
-
-    signature = request.headers.get("X-Line-Signature", "")
+    sig = request.headers.get("X-Line-Signature", "")
     body = await request.body()
     try:
-        handler.handle(body.decode("utf-8"), signature)
+        handler.handle(body.decode("utf-8"), sig)
     except InvalidSignatureError:
         raise HTTPException(status_code=400, detail="Invalid signature")
-    # ตอบทันทีเพื่อกัน timeout
     return JSONResponse({"status": "ok"})
 
-
-# ====== LINE HANDLER (ลงทะเบียนใน startup) ======
+# ===== LINE handler =====
 def handle_message(event):
-    """
-    1) ตอบทันทีสั้นๆ เพื่อให้ webhook เร็ว
-    2) ประมวลผล LLM แบบ background แล้ว push ตามไป (user/group/room)
-    """
     user_text = (event.message.text or "").strip()
 
-    # ตอบเร็วๆ ก่อน
+    # ตอบกลับเร็ว ๆ เพื่อกัน timeout
     try:
         if line_bot_api:
             line_bot_api.reply_message(
@@ -254,16 +209,15 @@ def handle_message(event):
     except Exception as e:
         print("Quick reply error:", e)
 
-    # ทำงานเบื้องหลัง
     def work():
         try:
-            answer = ask_llm_with_fallback(user_text)[:MAX_LINE_CHARS]
+            answer = ask_llm(user_text)
             to_id = get_target_id(event)
             if to_id and line_bot_api:
-                line_bot_api.push_message(to_id, TextSendMessage(text=answer))
+                line_bot_api.push_message(to_id, TextSendMessage(text=answer[:MAX_LINE_CHARS]))
             else:
-                print("⚠️ Cannot push (no target id or api not ready)")
+                print("⚠️ Cannot push (no id/api)")
         except Exception as e:
-            print("Background LLM error:", e)
+            print("BG error:", e)
 
     Thread(target=work, daemon=True).start()
