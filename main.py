@@ -21,20 +21,20 @@ PROMPT_SYSTEM = os.getenv(
     (
         "คุณคือผู้ช่วย AI สำหรับ LINE OA\n"
         "ทุกคำตอบต้องเป็นภาษาไทย 100% เท่านั้น\n"
-        "ห้ามใช้ภาษาอังกฤษแม้แต่ตัวเดียว เว้นแต่เป็นชื่อเฉพาะ (แต่ระบบจะลบทิ้งให้อยู่ดี)\n"
+        "ห้ามใช้ภาษาอังกฤษแม้แต่ตัวเดียว เว้นแต่เป็นชื่อเฉพาะ (ระบบจะลบทิ้งให้อยู่ดี)\n"
         "ตอบอย่างกวนๆ ฮาๆ เหมือนเพื่อนสนิท\n"
         "ลงท้ายทุกคำตอบด้วย \"จร้าาาาา\"\n"
         "ห้ามละเมิดกฎนี้เด็ดขาด"
     ),
 )
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "350"))
-MAX_CHARS = int(os.getenv("MAX_CHARS", "1000"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "350"))  # จำกัดความยาวจากโมเดล
+MAX_CHARS  = int(os.getenv("MAX_CHARS",  "1000")) # กันยาวเกินเวลาแสดงใน LINE
 
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    print("⚠️ Missing LINE env variables: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
+    print("⚠️ Missing LINE env: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="LINE × Ollama (TH only)", version="1.2.0")
+app = FastAPI(title="LINE × Ollama (TH-only tidy)", version="1.3.0")
 
 @app.get("/healthz")
 async def healthz():
@@ -54,37 +54,51 @@ def verify_line_signature(body: bytes, signature: str, secret: str) -> bool:
     expected_signature = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected_signature, signature or "")
 
-# ── Helpers: Thai-only postprocess ────────────────────────────────────────────
-ENG_PATTERN = re.compile(r"[A-Za-z]+")
-
-def _strip_english(s: str) -> str:
-    return ENG_PATTERN.sub("", s)
+# ── Helpers: Thai-safe cleaning ───────────────────────────────────────────────
+THAI_RANGE = r"\u0E00-\u0E7F"
+RE_THINK   = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 
 def _remove_reasoning(s: str) -> str:
-    # ตัด reasoning ที่อยู่ใน <think>...</think>
-    return re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
+    # ตัด reasoning block แบบไม่โลภ
+    return RE_THINK.sub("", s)
+
+def _keep_thai_digits_punct(s: str) -> str:
+    # อนุญาต: ไทย, ตัวเลขไทย/อารบิก, เว้นวรรค, และวรรคตอนทั่วไป
+    return re.sub(
+        rf"[^{THAI_RANGE}0-9๐-๙\s\.\,\!\?\:\;\-\+\=\(\)\[\]{{}}\"'\/…%]",
+        "",
+        s
+    )
+
+def _tidy_text(s: str) -> str:
+    # เก็บเว้นวรรค/วรรคตอนให้เรียบร้อย
+    s = re.sub(r"[ \t]{2,}", " ", s)               # ช่องว่างซ้อน
+    s = re.sub(r"\n{3,}", "\n\n", s)               # บรรทัดว่างซ้อน
+    s = re.sub(r"[，、]", ",", s)                   # จุลภาค/คั่นจีน → ,
+    s = re.sub(r"[。]", ".", s)                     # จุดจีน → .
+    s = re.sub(r"([,\.!?])\1{1,}", r"\1", s)       # ลดเครื่องหมายซ้ำ
+    s = re.sub(r"\s+([,\.!?])", r"\1", s)          # ตัดช่องว่างก่อนเครื่องหมาย
+    s = re.sub(r"([,\.!?])([^\s])", r"\1 \2", s)   # เติมช่องว่างหลังเครื่องหมาย
+    return s.strip()
 
 def _postprocess_thai(reply: str) -> str:
     reply = (reply or "").strip()
-
-    # ลบ reasoning
     reply = _remove_reasoning(reply)
+    reply = _keep_thai_digits_punct(reply)
+    reply = _tidy_text(reply)
 
-    # ลบภาษาอังกฤษทั้งหมด
-    reply = _strip_english(reply)
+    # ถ้าเนื้อหาไทยน้อยเกินไป → คัดกรองครั้งสุดท้ายกันเหลือสัญลักษณ์ล้วน
+    thai_count = len(re.findall(rf"[{THAI_RANGE}]", reply))
+    if thai_count < 10:
+        reply = "".join(re.findall(rf"[{THAI_RANGE}0-9๐-๙\s\.\,\!\?\…%]", reply)).strip()
 
-    # ล้างช่องว่างซ้ำ
-    reply = re.sub(r"[ \t]{2,}", " ", reply)
-    reply = re.sub(r"\n{3,}", "\n\n", reply)
-
-    # จำกัดความยาว
+    # จำกัดความยาวเพื่อความอ่านง่าย
     if len(reply) > MAX_CHARS:
-        reply = reply[: MAX_CHARS - 1] + "…"
+        reply = reply[:MAX_CHARS - 1] + "…"
 
     # บังคับลงท้าย
     if not reply.endswith("จร้าาาาา"):
         reply = reply.rstrip("!?. \n\r\t") + " จร้าาาาา"
-
     return reply
 
 def _fallback_extract_content(data: Dict[str, Any]) -> Optional[str]:
@@ -178,6 +192,7 @@ async def line_callback(
         if etype == "message" and event.get("message", {}).get("type") == "text":
             user_text = (event["message"]["text"] or "").strip()
 
+            # คำสั่งตรวจสุขภาพบอท
             if user_text.lower() in {"ping", "health", "status", "เช็คบอท"}:
                 await reply_to_line(reply_token, _postprocess_thai("บอทยังทำงานปกติดีค่า ✅"))
                 continue
@@ -188,6 +203,7 @@ async def line_callback(
         elif etype in {"follow", "join"}:
             await reply_to_line(reply_token, _postprocess_thai("สวัสดีค่า พิมพ์คำถามมาได้เลย"))
 
+        # เงียบสำหรับ event อื่น ๆ
     return {"ok": True}
 
 # ── Local run ─────────────────────────────────────────────────────────────────
