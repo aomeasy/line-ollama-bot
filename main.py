@@ -1,99 +1,171 @@
+# main.py
+import base64
+import hashlib
+import hmac
+import json
 import os
-import requests
-from flask import Flask, request, abort
+from typing import Any, Dict, List, Optional
 
-from linebot import (
-    LineBotApi, WebhookHandler
-)
-from linebot.exceptions import (
-    InvalidSignatureError
-)
-from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage,
-)
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
 
-# Initialize Flask app
-app = Flask(__name__)
+# ─── Env ──────────────────────────────────────────────────────────────────────
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
-# --- Environment Variables ---
-# Get LINE credentials from environment variables for security.
-# These must be set on your Render dashboard.
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
-LINE_CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
+if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
+    # เตือนตอนสตาร์ท (บน Render จะเห็นใน Logs)
+    print("⚠️  Missing LINE env variables: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
-# Get Ollama server and model details from environment variables.
-# OLLAMA_API_URL should be your server's IP address.
-# OLLAMA_MODEL should be the model name you want to use.
-OLLAMA_API_URL = os.getenv('OLLAMA_API_URL')
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL')
+# ─── App ──────────────────────────────────────────────────────────────────────
+app = FastAPI(title="LINE × Ollama Bot", version="0.1.0")
 
-# Check if required variables are set
-if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, OLLAMA_API_URL, OLLAMA_MODEL]):
-    print("Error: Please set all required environment variables.")
-    # Exit if variables are missing to prevent runtime errors.
-    exit(1)
 
-# Initialize LINE Bot API and Webhook Handler
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-@app.route("/callback", methods=['POST'])
-def callback():
-    """
-    Endpoint for LINE's webhook.
-    Receives messages from LINE, verifies the signature, and passes it to the handler.
-    """
-    signature = request.headers['X-Line-Signature']
-    body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
-
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        print("Invalid signature. Please check your channel access token or channel secret.")
-        abort(400) # Returns a 400 Bad Request error if the signature is invalid.
-    
-    return 'OK'
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    """
-    Handles incoming text messages from LINE.
-    """
-    user_message = event.message.text
-    print(f"Received message: {user_message}")
-
-    # --- Ollama API Call ---
-    # Prepare the payload to send to the Ollama API
-    ollama_payload = {
+@app.get("/healthz")
+async def healthz():
+    return {
+        "status": "ok",
+        "ollama": OLLAMA_API_URL,
         "model": OLLAMA_MODEL,
-        "prompt": user_message,
-        "stream": False # Set to False for a single, complete response.
     }
-    
-    try:
-        # Use requests.post to send the message to the Ollama server
-        response = requests.post(f"{OLLAMA_API_URL}/api/generate", json=ollama_payload)
-        response.raise_for_status() # Raises an exception for bad status codes (4xx or 5xx)
-        
-        ollama_response_data = response.json()
-        generated_text = ollama_response_data.get("response", "ขออภัย, ไม่สามารถสร้างคำตอบได้ในขณะนี้")
-        
-        print(f"Ollama responded: {generated_text}")
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling Ollama API: {e}")
-        generated_text = "ขออภัย, เกิดข้อผิดพลาดในการเชื่อมต่อกับ AI"
 
-    # --- LINE Reply ---
-    # Reply to the user on LINE with the generated text.
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=generated_text)
+# ─── Utils: LINE Signature ────────────────────────────────────────────────────
+def verify_line_signature(body: bytes, signature: str, secret: str) -> bool:
+    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
+    expected_signature = base64.b64encode(mac).decode("utf-8")
+    # LINE ส่งเป็น Base64; เทียบแบบคงที่
+    return hmac.compare_digest(expected_signature, signature)
+
+
+# ─── Utils: Call Ollama ───────────────────────────────────────────────────────
+async def ask_ollama(prompt: str, user_id: Optional[str] = None) -> str:
+    """
+    เรียก Ollama /api/chat (Ollama >= 0.1x รองรับ) แบบ non-stream
+    """
+    url = f"{OLLAMA_API_URL}/api/chat"
+    system_prompt = (
+        "You are a helpful Thai assistant for LINE OA. "
+        "Answer clearly in Thai by default, be concise, and use bullet points when helpful."
     )
 
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            # สามารถแทรก user-specific context ผ่าน user_id ได้ถ้าต้องการในอนาคต
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        # เผื่ออนาคต: "options": {"temperature": 0.3}
+    }
+
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            print(f"❌ Ollama error: {e}")
+            return "ขออภัย ระบบ AI ตอบไม่ได้ชั่วคราว ลองอีกครั้งได้ไหมคะ"
+
+    data = resp.json()
+    # รูปแบบตอบกลับของ /api/chat: {"message":{"role":"assistant","content":"..."},"done":true,...}
+    content = (
+        (data.get("message") or {}).get("content")
+        or _fallback_extract_content(data)
+        or "ขออภัย ไม่พบคำตอบที่เหมาะสมค่ะ"
+    )
+    return content.strip()
+
+
+def _fallback_extract_content(data: Dict[str, Any]) -> Optional[str]:
+    # เผื่อบางเวอร์ชัน/รีสปอนส์ มีฟิลด์อื่น
+    if "messages" in data and isinstance(data["messages"], list) and data["messages"]:
+        last = data["messages"][-1]
+        return last.get("content")
+    if "response" in data:
+        return data.get("response")
+    return None
+
+
+# ─── Utils: Reply to LINE ─────────────────────────────────────────────────────
+async def reply_to_line(reply_token: str, text: str) -> None:
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": text[:4900]}],  # กันยาวเกิน
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(url, headers=headers, json=body)
+        if resp.status_code != 200:
+            # Log ไว้ดูบน Render
+            print(f"❌ LINE reply error {resp.status_code}: {resp.text}")
+            # ไม่ raise เพื่อให้ webhook ตอบ 200 ให้ LINE ไม่ต้อง retry ยาว
+
+
+# ─── Webhook Endpoint ─────────────────────────────────────────────────────────
+@app.post("/callback")
+async def line_callback(
+    request: Request,
+    x_line_signature: str = Header(None),
+):
+    if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="LINE config missing")
+
+    body_bytes = await request.body()
+
+    # ตรวจสอบลายเซ็น
+    if not x_line_signature or not verify_line_signature(body_bytes, x_line_signature, LINE_CHANNEL_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    try:
+        payload = json.loads(body_bytes.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    events: List[Dict[str, Any]] = payload.get("events", [])
+    # รองรับหลาย event ในครั้งเดียว
+    for event in events:
+        etype = event.get("type")
+        reply_token = event.get("replyToken")
+        source = event.get("source", {})
+        user_id = source.get("userId")
+
+        # รับเฉพาะข้อความ
+        if etype == "message" and event.get("message", {}).get("type") == "text":
+            user_text = event["message"]["text"].strip()
+
+            # เคสง่าย ๆ: คำสั่งเช็คสถานะ
+            if user_text in ("ping", "health", "status", "เช็คบอท"):
+                await reply_to_line(reply_token, "บอทยังทำงานปกติดีค่ะ ✅")
+                continue
+
+            # เรียก Ollama
+            ai_reply = await ask_ollama(user_text, user_id=user_id)
+            await reply_to_line(reply_token, ai_reply)
+
+        # กรณีอื่น ๆ (join / follow / postback ฯลฯ) — ตอบสั้น ๆ
+        elif etype in ("follow", "join"):
+            await reply_to_line(reply_token, "สวัสดีค่ะ พิมพ์คำถามมาได้เลยนะคะ 🤖")
+        else:
+            # เงียบไว้เพื่อไม่ให้วงจรตอบกลับไม่จำเป็น
+            pass
+
+    # LINE ต้องการ 200 ภายใน ~1 วินาที
+    return {"ok": True}
+    
+
+# ─── Local run (Render ใช้ start command เอง) ────────────────────────────────
 if __name__ == "__main__":
-    # Get the port from the environment variable (Render sets this automatically)
-    port = int(os.environ.get('PORT', 5000))
-    # Run the Flask app on all available network interfaces.
-    app.run(host='0.0.0.0', port=port)
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
