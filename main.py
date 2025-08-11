@@ -17,27 +17,25 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
-# PROMPT_BASE: กติกาหลักของบอท (ไทยล้วน + ลงท้าย ฯลฯ)
+# กติกาหลัก (ยังอ่านจาก ENV ได้ตามเดิม)
 PROMPT_BASE = os.getenv(
     "PROMPT_SYSTEM",
     (
         "คุณคือผู้ช่วย AI สำหรับ LINE OA\n"
-        "ทุกคำตอบต้องเป็นภาษาไทย 100% เท่านั้น\n"
-        "ห้ามใช้ภาษาอังกฤษแม้แต่ตัวเดียว เว้นแต่เป็นชื่อเฉพาะ (ระบบจะลบทิ้งให้อยู่ดี)\n"
-        "ตอบอย่างกวนๆ ฮาๆ เหมือนเพื่อนสนิท\n"
-        "ลงท้ายทุกคำตอบด้วย \"จร้าาาาา\"\n"
-        "ห้ามละเมิดกฎนี้เด็ดขาด"
+        "ตอบอย่างเป็นมิตร เข้าใจง่าย และสุภาพ\n"
+        "ถ้าผู้ใช้ไม่ได้ขอเป็นภาษาอื่น ให้ตอบเป็นภาษาไทยโดยอัตโนมัติ\n"
+        "หากเหมาะสม สามารถใช้ bullet points หรือย่อหน้าเพื่อให้อ่านง่าย\n"
+        "ลงท้ายด้วยคำว่า \"งับ\" เพื่อความเป็นกันเอง"
     ),
 )
 
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "350"))  # จำกัดความยาวจากโมเดล
-MAX_CHARS  = int(os.getenv("MAX_CHARS",  "1000")) # กันยาวเกินเวลาแสดงใน LINE
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "350"))  # จำกัดฝั่งโมเดล (คุมความฟุ้ง)
 
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     print("⚠️ Missing LINE env: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="LINE × Ollama (TH + Utilities)", version="2.0.0")
+app = FastAPI(title="LINE × Ollama (No English Strip, No Char Limit)", version="2.1.0")
 
 @app.get("/healthz")
 async def healthz():
@@ -48,7 +46,6 @@ async def healthz():
         "has_line_token": bool(LINE_CHANNEL_ACCESS_TOKEN),
         "has_line_secret": bool(LINE_CHANNEL_SECRET),
         "max_tokens": MAX_TOKENS,
-        "max_chars": MAX_CHARS,
     }
 
 # ── LINE Signature ────────────────────────────────────────────────────────────
@@ -57,30 +54,28 @@ def verify_line_signature(body: bytes, signature: str, secret: str) -> bool:
     expected_signature = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected_signature, signature or "")
 
-# ── Personas (System Prompts) ─────────────────────────────────────────────────
+# ── Personas ──────────────────────────────────────────────────────────────────
 SYSTEM_PROMPTS: Dict[str, Dict[str, str]] = {
-    "general":   {"name": "🤖 ผู้ช่วยทั่วไป",      "prompt": "คุณเป็นผู้ช่วย AI ที่เป็นมิตรและใช้ภาษาไทย ตอบสุภาพ กระชับ ได้ใจความ"},
-    "teacher":   {"name": "👨‍🏫 ครูสอนพิเศษ",       "prompt": "คุณเป็นครูใจดี อธิบายเรื่องยากให้เข้าใจง่าย ยกตัวอย่าง ถามย้ำเพื่อความเข้าใจ"},
-    "consultant":{"name": "💼 ที่ปรึกษาธุรกิจ",     "prompt": "คุณเป็นที่ปรึกษามืออาชีพ วิเคราะห์เป็นระบบ เสนอมาตรการที่ทำได้จริง"},
-    "programmer":{"name": "💻 โปรแกรมเมอร์",        "prompt": "คุณเป็นโปรแกรมเมอร์ อธิบายเทคนิคให้เข้าใจง่าย พร้อมตัวอย่างโค้ด และ best practices"},
-    "doctor":    {"name": "👩‍⚕️ หมอให้คำปรึกษา",   "prompt": "คุณให้ความรู้สุขภาพเบื้องต้น และเตือนให้ปรึกษาแพทย์จริงสำหรับการวินิจฉัย"},
-    "chef":      {"name": "👨‍🍳 เชฟครัวไทย",       "prompt": "คุณเป็นเชฟอาหารไทย แนะนำเมนู วิธีทำ เทคนิค และเคล็ดลับในครัว"},
-    "counselor": {"name": "🧠 นักจิตวิทยา",        "prompt": "คุณรับฟังด้วยความเข้าใจ ให้คำปรึกษาอย่างอบอุ่นและสร้างสรรค์"},
-    "fitness":   {"name": "💪 โค้ชฟิตเนส",          "prompt": "คุณแนะนำการออกกำลังกาย โภชนาการ และเป็นกำลังใจ"},
-    "travel":    {"name": "✈️ ไกด์ท่องเที่ยว",     "prompt": "คุณเป็นไกด์ รู้สถานที่ วัฒนธรรม อาหาร และเคล็ดลับการเดินทาง"},
-    "comedian":  {"name": "😄 นักตลก",             "prompt": "คุณตอบแบบสนุก มีอารมณ์ขัน แต่ไม่หยาบ และยังให้ข้อมูลได้"},
+    "general":   {"name": "🤖 ผู้ช่วยทั่วไป",      "prompt": "ตอบกระชับ ได้ใจความ และชัดเจน"},
+    "teacher":   {"name": "👨‍🏫 ครูสอนพิเศษ",       "prompt": "อธิบายให้เข้าใจง่าย ยกตัวอย่าง และถามย้ำความเข้าใจ"},
+    "consultant":{"name": "💼 ที่ปรึกษาธุรกิจ",     "prompt": "วิเคราะห์เป็นระบบ เสนอมาตรการที่ทำได้จริง"},
+    "programmer":{"name": "💻 โปรแกรมเมอร์",        "prompt": "อธิบายเทคนิคให้เข้าใจง่าย พร้อมตัวอย่างโค้ด/แนวปฏิบัติที่ดี"},
+    "doctor":    {"name": "👩‍⚕️ หมอให้คำปรึกษา",   "prompt": "ให้ความรู้สุขภาพเบื้องต้น พร้อมแนะนำพบแพทย์เมื่อต้องการวินิจฉัย"},
+    "chef":      {"name": "👨‍🍳 เชฟครัวไทย",       "prompt": "แนะนำเมนู วิธีทำ เคล็ดลับ และการจัดวัตถุดิบ"},
+    "counselor": {"name": "🧠 นักจิตวิทยา",        "prompt": "รับฟังอย่างเข้าใจ ให้คำแนะนำอย่างอ่อนโยน"},
+    "fitness":   {"name": "💪 โค้ชฟิตเนส",          "prompt": "แนะนำการออกกำลังกายและโภชนาการ ให้กำลังใจ"},
+    "travel":    {"name": "✈️ ไกด์ท่องเที่ยว",     "prompt": "แนะนำสถานที่ วัฒนธรรม อาหาร และเคล็ดลับการเดินทาง"},
+    "comedian":  {"name": "😄 นักตลก",             "prompt": "ตอบสนุก มีอารมณ์ขัน แต่ยังให้ข้อมูลได้"},
 }
-
-# In-memory session (สำหรับ demo)
 user_sessions: Dict[str, Dict[str, str]] = {}
 
-# ── Utilities (เหมือนในโค้ด Flask เดิม) ────────────────────────────────────
+# ── Utilities ─────────────────────────────────────────────────────────────────
 MOTIVATIONAL_QUOTES = [
     "💪 ความสำเร็จเริ่มจากการลงมือทำ",
     "🌟 วันนี้คือโอกาสใหม่ที่จะทำให้ดีขึ้น",
     "🚀 อย่ายอมแพ้ เพราะสิ่งดีๆ กำลังจะมา",
     "💎 คุณแข็งแกร่งกว่าที่คิด",
-    "🌈 หลังฝนย่อมมีรุ้ง"
+    "🌈 หลังฝนย่อมมีรุ้ง",
 ]
 
 async def get_exchange_rate_text() -> str:
@@ -179,21 +174,21 @@ def loan_calc_text(principal: float, rate: float, years: float) -> str:
     except Exception:
         return "❌ รูปแบบไม่ถูกต้อง | ตัวอย่าง: สินเชื่อ 1000000 5 30"
 
-# ── LINE Reply Helpers (Text + Quick Reply) ───────────────────────────────────
+# ── Reply helpers ─────────────────────────────────────────────────────────────
 async def reply_text(reply_token: str, text: str) -> None:
+    # หมายเหตุ: LINE จำกัดข้อความ ~5000 ตัวอักษร
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:4900]}]}
+    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.post(url, headers=headers, json=payload)
         if r.status_code != 200:
             print(f"❌ LINE reply error {r.status_code}: {r.text}")
 
 def quick_reply_items(labels_texts: List[Dict[str, str]]) -> Dict[str, Any]:
-    # labels_texts: [{"label": "xxx", "text": "yyy"}, ...]
     return {
         "items": [
             {"type": "action", "action": {"type": "message", "label": it["label"], "text": it["text"]}}
@@ -211,7 +206,7 @@ async def reply_text_with_quickreply(reply_token: str, text: str, items: List[Di
         "replyToken": reply_token,
         "messages": [{
             "type": "text",
-            "text": text[:4900],
+            "text": text,
             "quickReply": quick_reply_items(items)
         }]
     }
@@ -221,8 +216,8 @@ async def reply_text_with_quickreply(reply_token: str, text: str, items: List[Di
             print(f"❌ LINE reply error {r.status_code}: {r.text}")
 
 def get_persona_quickreply_message() -> (str, List[Dict[str, str]]):
-    text = "🎭 เลือกบุคลิกที่ต้องการ:"
-    items = [{"label": v["name"], "text": f"เลือก:{k}"} for k, v in SYSTEM_PROMPTS.items()]
+    text = "🎭 เลือกบุคลิกที่ต้องการ"
+    items = [{"label": v["name"], "text": f"เลือก{k}"} for k, v in SYSTEM_PROMPTS.items()]
     return text, items
 
 def get_tools_quickreply_message() -> (str, List[Dict[str, str]]):
@@ -245,19 +240,11 @@ def get_current_system_info(user_id: str) -> Dict[str, str]:
     key = user_sessions.get(user_id, {}).get("system_prompt", "general")
     return SYSTEM_PROMPTS.get(key, SYSTEM_PROMPTS["general"])
 
-# ── Thai-only Postprocess ─────────────────────────────────────────────────────
-THAI_RANGE = r"\u0E00-\u0E7F"
-RE_THINK   = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+# ── Post-process: ตัดเฉพาะ <think> + จัดวรรคตอน + บังคับลงท้าย ─────────────
+RE_THINK = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 
 def _remove_reasoning(s: str) -> str:
     return RE_THINK.sub("", s)
-
-def _keep_thai_digits_punct(s: str) -> str:
-    return re.sub(
-        rf"[^{THAI_RANGE}0-9๐-๙\s\.\,\!\?\:\;\-\+\=\(\)\[\]{{}}\"'\/…%]",
-        "",
-        s
-    )
 
 def _tidy_text(s: str) -> str:
     s = re.sub(r"[ \t]{2,}", " ", s)
@@ -269,19 +256,10 @@ def _tidy_text(s: str) -> str:
     s = re.sub(r"([,\.!?])([^\s])", r"\1 \2", s)
     return s.strip()
 
-def _postprocess_thai(reply: str) -> str:
+def _postprocess(reply: str) -> str:
     reply = (reply or "").strip()
     reply = _remove_reasoning(reply)
-    reply = _keep_thai_digits_punct(reply)
     reply = _tidy_text(reply)
-
-    thai_count = len(re.findall(rf"[{THAI_RANGE}]", reply))
-    if thai_count < 10:
-        reply = "".join(re.findall(rf"[{THAI_RANGE}0-9๐-๙\s\.\,\!\?\…%]", reply)).strip()
-
-    if len(reply) > MAX_CHARS:
-        reply = reply[:MAX_CHARS - 1] + "…"
-
     if not reply.endswith("จร้าาาาา"):
         reply = reply.rstrip("!?. \n\r\t") + " จร้าาาาา"
     return reply
@@ -289,7 +267,6 @@ def _postprocess_thai(reply: str) -> str:
 # ── Call Ollama (/api/chat) ───────────────────────────────────────────────────
 async def ask_ollama(user_text: str, persona_prompt: str) -> str:
     url = f"{OLLAMA_API_URL}/api/chat"
-    # รวม persona + base prompt เพื่อ “ย้ำ” บุคลิกพร้อมกติกาหลัก
     system_prompt = f"{PROMPT_BASE}\n\n---\nโหมดปัจจุบัน:\n{persona_prompt}".strip()
 
     payload = {
@@ -314,9 +291,8 @@ async def ask_ollama(user_text: str, persona_prompt: str) -> str:
             data = r.json()
         except httpx.HTTPError as e:
             print(f"❌ Ollama HTTP error: {e}")
-            return _postprocess_thai("ขออภัย ระบบ AI ตอบไม่ได้ชั่วคราว ลองอีกครั้งได้ไหมคะ")
+            return _postprocess("ขออภัย ระบบ AI ตอบไม่ได้ชั่วคราว ลองอีกครั้งได้ไหมคะ")
 
-    # รองรับหลายรูปแบบรีสปอนส์
     content = None
     if isinstance(data.get("message"), dict):
         content = data["message"].get("content")
@@ -329,7 +305,7 @@ async def ask_ollama(user_text: str, persona_prompt: str) -> str:
     if not content:
         content = "ขออภัย ไม่พบคำตอบที่เหมาะสมค่ะ"
 
-    return _postprocess_thai(content)
+    return _postprocess(content)
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 @app.post("/callback")
@@ -357,38 +333,37 @@ async def line_callback(
         user_id = source.get("userId", "anonymous")
 
         if user_id not in user_sessions:
-            user_sessions[user_id] = {"system_prompt": "general"}  # ค่าเริ่มต้น
+            user_sessions[user_id] = {"system_prompt": "general"}
 
         if etype == "message" and event.get("message", {}).get("type") == "text":
             user_text = (event["message"]["text"] or "").strip()
             lower = user_text.lower()
 
-            # ——— คำสั่งควบคุมโหมด/เมนู
+            # โหมด/เมนู
             if lower in {"ai", "แชท", "chat"}:
                 name = get_current_system_info(user_id)["name"]
                 msg = f"🤖 กลับสู่โหมด AI แล้ว!\nบุคลิกปัจจุบัน: {name}\n\nพิมพ์ 'เมนู' เพื่อเปลี่ยนบุคลิก หรือถามคำถามได้เลย"
-                await reply_text(reply_token, _postprocess_thai(msg))
+                await reply_text(reply_token, _postprocess(msg))
                 continue
 
             if lower in {"เมนู", "menu", "เลือก", "เปลี่ยน"}:
                 text, items = get_persona_quickreply_message()
-                await reply_text_with_quickreply(reply_token, _postprocess_thai(text), items)
+                await reply_text_with_quickreply(reply_token, _postprocess(text), items)
                 continue
 
-            if lower in {"เครื่องมือ", "tools", "ฟังก์ชัน", "functions", "utils"}:
+            if lower in {"เครื่องมือ", "tools", "ฟังก์ชัน", "functions","tool", "utils"}:
                 text, items = get_tools_quickreply_message()
-                await reply_text_with_quickreply(reply_token, _postprocess_thai(text), items)
+                await reply_text_with_quickreply(reply_token, _postprocess(text), items)
                 continue
 
-            if user_text.startswith("เลือก:"):
-                key = user_text.replace("เลือก:", "").strip()
+            if user_text.startswith("เลือก"):
+                key = user_text.replace("เลือก", "").strip()
                 if key in SYSTEM_PROMPTS:
                     user_sessions[user_id]["system_prompt"] = key
                     name = SYSTEM_PROMPTS[key]["name"]
-                    msg = f"✅ เปลี่ยนบุคลิกเป็น {name} เรียบร้อยแล้ว!\nลองถามได้เลย หรือพิมพ์ 'เมนู' เพื่อเปลี่ยนอีกครั้ง"
-                    await reply_text(reply_token, _postprocess_thai(msg))
+                    await reply_text(reply_token, _postprocess(f"✅ เปลี่ยนบุคลิกเป็น {name} เรียบร้อยแล้ว!\nลองถามได้เลย หรือพิมพ์ 'เมนู' เพื่อเปลี่ยนอีกครั้ง"))
                 else:
-                    await reply_text(reply_token, _postprocess_thai("❌ ไม่มีบุคลิกนี้นะ ลองพิมพ์ 'เมนู' เพื่อดูรายการ"))
+                    await reply_text(reply_token, _postprocess("❌ ไม่มีบุคลิกนี้นะ ลองพิมพ์ 'เมนู' เพื่อดูรายการ"))
                 continue
 
             if lower in {"help", "ช่วย", "สถานะ", "status"}:
@@ -403,21 +378,20 @@ async def line_callback(
                     "• อัตราแลกเปลี่ยน, เวลา, กำลังใจ\n"
                     "• BMI, แปลงหน่วย, QR, สี, สินเชื่อ, รหัสผ่าน"
                 )
-                await reply_text(reply_token, _postprocess_thai(msg))
+                await reply_text(reply_token, _postprocess(msg))
                 continue
 
-            # ——— เครื่องมือเสริม
+            # เครื่องมือ
             if lower == "อัตราแลกเปลี่ยน":
-                text = await get_exchange_rate_text()
-                await reply_text(reply_token, _postprocess_thai(text))
+                await reply_text(reply_token, _postprocess(await get_exchange_rate_text()))
                 continue
 
             if lower == "เวลา":
-                await reply_text(reply_token, _postprocess_thai(get_thai_time_text()))
+                await reply_text(reply_token, _postprocess(get_thai_time_text()))
                 continue
 
             if lower in {"กำลังใจ", "motivate"}:
-                await reply_text(reply_token, _postprocess_thai(random.choice(MOTIVATIONAL_QUOTES)))
+                await reply_text(reply_token, _postprocess(random.choice(MOTIVATIONAL_QUOTES)))
                 continue
 
             if lower.startswith("รหัสผ่าน"):
@@ -425,7 +399,7 @@ async def line_callback(
                 length = 12
                 if len(parts) > 1 and parts[1].isdigit():
                     length = int(parts[1])
-                await reply_text(reply_token, _postprocess_thai(generate_password_text(length)))
+                await reply_text(reply_token, _postprocess(generate_password_text(length)))
                 continue
 
             if lower.startswith("bmi"):
@@ -433,11 +407,11 @@ async def line_callback(
                 if len(parts) == 3:
                     try:
                         w = float(parts[1]); h = float(parts[2])
-                        await reply_text(reply_token, _postprocess_thai(calculate_bmi_text(w, h)))
+                        await reply_text(reply_token, _postprocess(calculate_bmi_text(w, h)))
                     except Exception:
-                        await reply_text(reply_token, _postprocess_thai("❌ รูปแบบไม่ถูกต้อง | ตัวอย่าง: BMI 70 175"))
+                        await reply_text(reply_token, _postprocess("❌ รูปแบบไม่ถูกต้อง | ตัวอย่าง: BMI 70 175"))
                 else:
-                    await reply_text(reply_token, _postprocess_thai("📊 วิธีใช้ BMI: พิมพ์ 'BMI [น้ำหนักกก.] [ส่วนสูงซม.]'"))
+                    await reply_text(reply_token, _postprocess("📊 วิธีใช้ BMI: พิมพ์ 'BMI [น้ำหนักกก.] [ส่วนสูงซม.]'"))
                 continue
 
             if lower.startswith("แปลง"):
@@ -445,24 +419,24 @@ async def line_callback(
                 if len(parts) >= 4:
                     try:
                         val = float(parts[1]); frm = parts[2]; to = parts[3]
-                        await reply_text(reply_token, _postprocess_thai(convert_units_text(val, frm, to)))
+                        await reply_text(reply_token, _postprocess(convert_units_text(val, frm, to)))
                     except Exception:
-                        await reply_text(reply_token, _postprocess_thai("❌ รูปแบบไม่ถูกต้อง"))
+                        await reply_text(reply_token, _postprocess("❌ รูปแบบไม่ถูกต้อง"))
                 else:
-                    await reply_text(reply_token, _postprocess_thai("🔄 แปลง [ตัวเลข] [หน่วยเดิม] [หน่วยใหม่]\nเช่น: แปลง 100 cm m"))
+                    await reply_text(reply_token, _postprocess("🔄 แปลง [ตัวเลข] [หน่วยเดิม] [หน่วยใหม่]\nเช่น: แปลง 100 cm m"))
                 continue
 
             if lower.startswith("qr "):
                 text = user_text[3:].strip()
                 if text:
-                    await reply_text(reply_token, _postprocess_thai(get_qr_text(text)))
+                    await reply_text(reply_token, _postprocess(get_qr_text(text)))
                 else:
-                    await reply_text(reply_token, _postprocess_thai("📱 พิมพ์: QR ข้อความ"))
+                    await reply_text(reply_token, _postprocess("📱 พิมพ์: QR ข้อความ"))
                 continue
 
             if lower.startswith("สี ") or user_text.startswith("#"):
                 code = user_text[2:].strip() if user_text.startswith("สี ") else user_text.strip()
-                await reply_text(reply_token, _postprocess_thai(color_code_info_text(code)))
+                await reply_text(reply_token, _postprocess(color_code_info_text(code)))
                 continue
 
             if lower.startswith("สินเชื่อ"):
@@ -470,22 +444,21 @@ async def line_callback(
                 if len(parts) == 4:
                     try:
                         p = float(parts[1]); r = float(parts[2]); y = float(parts[3])
-                        await reply_text(reply_token, _postprocess_thai(loan_calc_text(p, r, y)))
+                        await reply_text(reply_token, _postprocess(loan_calc_text(p, r, y)))
                     except Exception:
-                        await reply_text(reply_token, _postprocess_thai("❌ รูปแบบไม่ถูกต้อง"))
+                        await reply_text(reply_token, _postprocess("❌ รูปแบบไม่ถูกต้อง"))
                 else:
-                    await reply_text(reply_token, _postprocess_thai("💰 สินเชื่อ [เงินกู้] [ดอกเบี้ย%] [ปี]\nเช่น: สินเชื่อ 1000000 5 30"))
+                    await reply_text(reply_token, _postprocess("💰 สินเชื่อ [เงินกู้] [ดอกเบี้ย%] [ปี]\nเช่น: สินเชื่อ 1000000 5 30"))
                 continue
 
-            # ——— ปกติ: ส่งให้ AI ตาม persona ปัจจุบัน
+            # ปกติ: ส่งให้ AI ตาม persona
             persona = get_current_system_info(user_id)
             ai_reply = await ask_ollama(user_text, persona["prompt"])
             await reply_text(reply_token, ai_reply)
 
         elif etype in {"follow", "join"}:
-            await reply_text(reply_token, _postprocess_thai("สวัสดีค่า พิมพ์ 'เมนู' เพื่อเลือกบุคลิก หรือพิมพ์ 'เครื่องมือ' เพื่อดูฟังก์ชันเสริม"))
+            await reply_text(reply_token, _postprocess("สวัสดีค่า พิมพ์ 'เมนู' เพื่อเลือกบุคลิก หรือพิมพ์ 'เครื่องมือ' เพื่อดูฟังก์ชันเสริม"))
 
-        # event อื่นๆ เงียบ
     return {"ok": True}
 
 # ── Local run ─────────────────────────────────────────────────────────────────
