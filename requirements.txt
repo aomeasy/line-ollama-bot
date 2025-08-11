@@ -1,5 +1,3 @@
-fastapi
-uvicorn[standard]
-python-dotenv
+Flask
 line-bot-sdk
 requests
