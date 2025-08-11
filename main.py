@@ -47,8 +47,9 @@ async def ask_ollama(prompt: str, user_id: Optional[str] = None) -> str:
     """
     url = f"{OLLAMA_API_URL}/api/chat"
     system_prompt = (
-        "You are a helpful Thai assistant for LINE OA. "
-        "Answer clearly in Thai by default, be concise, and use bullet points when helpful."
+      "คุณคือผู้ช่วย AI สำหรับ LINE OA พูดคุยเป็นภาษาไทยเท่านั้น "
+    "ตอบอย่างกวนๆ ฮาๆ เหมือนเป็นเพื่อนกัน"
+    "ถ้าผู้ใช้ถาม ให้ตอบลงท้ายด้วย จร้าาาาา"
     )
 
     payload = {
@@ -169,3 +170,4 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
