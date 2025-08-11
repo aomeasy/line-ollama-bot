@@ -1,4 +1,3 @@
-# main.py
 import base64
 import hashlib
 import hmac
@@ -28,14 +27,14 @@ PROMPT_SYSTEM = os.getenv(
         "ห้ามละเมิดกฎนี้เด็ดขาด"
     ),
 )
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "350"))  # ประมาณความยาวคำตอบจากโมเดล
-MAX_CHARS = int(os.getenv("MAX_CHARS", "1000"))   # กันยาวเกินเวลาส่งกลับ LINE
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "350"))
+MAX_CHARS = int(os.getenv("MAX_CHARS", "1000"))
 
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     print("⚠️ Missing LINE env variables: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="LINE × Ollama (TH only)", version="1.1.0")
+app = FastAPI(title="LINE × Ollama (TH only)", version="1.2.0")
 
 @app.get("/healthz")
 async def healthz():
@@ -56,31 +55,35 @@ def verify_line_signature(body: bytes, signature: str, secret: str) -> bool:
     return hmac.compare_digest(expected_signature, signature or "")
 
 # ── Helpers: Thai-only postprocess ────────────────────────────────────────────
-THAI_ALLOWED_EXTRA = r"0-9๐-๙\s\.\,\!\?\:\;\-\+\=\(\)\[\]{}\"'\/\n\r\t。、，！？：；…"  # เผื่อสัญลักษณ์ทั่วไป
 ENG_PATTERN = re.compile(r"[A-Za-z]+")
 
 def _strip_english(s: str) -> str:
-    # ตัดตัวอักษรอังกฤษทั้งหมดออกแบบเด็ดขาด
     return ENG_PATTERN.sub("", s)
+
+def _remove_reasoning(s: str) -> str:
+    # ตัด reasoning ที่อยู่ใน <think>...</think>
+    return re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
 
 def _postprocess_thai(reply: str) -> str:
     reply = (reply or "").strip()
 
+    # ลบ reasoning
+    reply = _remove_reasoning(reply)
+
     # ลบภาษาอังกฤษทั้งหมด
     reply = _strip_english(reply)
 
-    # ล้างช่องว่างซ้ำๆ ที่เกิดจากการลบ
+    # ล้างช่องว่างซ้ำ
     reply = re.sub(r"[ \t]{2,}", " ", reply)
     reply = re.sub(r"\n{3,}", "\n\n", reply)
 
-    # จำกัดความยาวก่อนส่งกลับ
+    # จำกัดความยาว
     if len(reply) > MAX_CHARS:
         reply = reply[: MAX_CHARS - 1] + "…"
 
-    # บังคับลงท้ายด้วย "จร้าาาาา"
-    end_tag = "จร้าาาาา"
-    if not reply.endswith(end_tag):
-        reply = reply.rstrip("!?. \n\r\t") + f" {end_tag}"
+    # บังคับลงท้าย
+    if not reply.endswith("จร้าาาาา"):
+        reply = reply.rstrip("!?. \n\r\t") + " จร้าาาาา"
 
     return reply
 
@@ -175,7 +178,6 @@ async def line_callback(
         if etype == "message" and event.get("message", {}).get("type") == "text":
             user_text = (event["message"]["text"] or "").strip()
 
-            # คำสั่งสั้น ๆ
             if user_text.lower() in {"ping", "health", "status", "เช็คบอท"}:
                 await reply_to_line(reply_token, _postprocess_thai("บอทยังทำงานปกติดีค่า ✅"))
                 continue
@@ -185,10 +187,6 @@ async def line_callback(
 
         elif etype in {"follow", "join"}:
             await reply_to_line(reply_token, _postprocess_thai("สวัสดีค่า พิมพ์คำถามมาได้เลย"))
-
-        else:
-            # เงียบสำหรับ event อื่น ๆ
-            pass
 
     return {"ok": True}
 
