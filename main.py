@@ -4,63 +4,112 @@ import hashlib
 import hmac
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 
-# ─── Env ──────────────────────────────────────────────────────────────────────
+# ─── Environment ──────────────────────────────────────────────────────────────
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
+PROMPT_SYSTEM = os.getenv(
+    "PROMPT_SYSTEM",
+    (
+        "คุณคือผู้ช่วย AI สำหรับ LINE OA พูดคุยเป็นภาษาไทยเท่านั้น "
+        "ตอบอย่างกวนๆ ฮาๆ เหมือนเป็นเพื่อนสนิท "
+        "ทุกคำตอบต้องเป็นภาษาไทย 100% และลงท้ายด้วยคำว่า \"จร้าาาาา\" เสมอ "
+        "ห้ามใช้ภาษาอังกฤษ ยกเว้นชื่อเฉพาะที่จำเป็นเท่านั้น และห้ามละเมิดกฎนี้เด็ดขาด"
+    ),
+)
+
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "400"))  # จำกัดความยาวคำตอบจากโมเดล
+MAX_CHARS = int(os.getenv("MAX_CHARS", "1200"))   # กันข้อความยาวเกินสำหรับ LINE
+
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    # เตือนตอนสตาร์ท (บน Render จะเห็นใน Logs)
     print("⚠️  Missing LINE env variables: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
-# ─── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="LINE × Ollama Bot", version="0.1.0")
+
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
+app = FastAPI(title="LINE × Ollama Bot", version="1.0.0")
 
 
 @app.get("/healthz")
 async def healthz():
     return {
         "status": "ok",
-        "ollama": OLLAMA_API_URL,
+        "ollama_url": OLLAMA_API_URL,
         "model": OLLAMA_MODEL,
+        "has_line_token": bool(LINE_CHANNEL_ACCESS_TOKEN),
+        "has_line_secret": bool(LINE_CHANNEL_SECRET),
     }
 
 
-# ─── Utils: LINE Signature ────────────────────────────────────────────────────
+# ─── Helpers: LINE signature ──────────────────────────────────────────────────
 def verify_line_signature(body: bytes, signature: str, secret: str) -> bool:
     mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).digest()
     expected_signature = base64.b64encode(mac).decode("utf-8")
-    # LINE ส่งเป็น Base64; เทียบแบบคงที่
-    return hmac.compare_digest(expected_signature, signature)
+    return hmac.compare_digest(expected_signature, signature or "")
 
 
-# ─── Utils: Call Ollama ───────────────────────────────────────────────────────
+# ─── Helpers: Post-process reply ──────────────────────────────────────────────
+def _postprocess_thai(reply: str) -> str:
+    reply = (reply or "").strip()
+
+    # ตัดความยาวเพื่อไม่ให้เกินข้อจำกัดของ LINE (และกันโมเดลพูดยืด)
+    if len(reply) > MAX_CHARS:
+        reply = reply[: MAX_CHARS - 1] + "…"
+
+    # ถ้าตัวอักษรอังกฤษเกิน ~30% ให้เตือนตัวเอง (soft check) เพื่อย้ำภาษาไทย
+    letters = re.findall(r"[A-Za-z]", reply)
+    if letters and (len(letters) / max(1, len(reply)) > 0.3):
+        reply += "\n(ขออภัย จะตอบเป็นภาษาไทยเท่านั้นตามนโยบาย จร้าาาาา)"
+
+    # บังคับลงท้ายด้วย "จร้าาาาา"
+    if not reply.endswith("จร้าาาาา"):
+        reply = reply.rstrip("!?. \n") + " จร้าาาาา"
+
+    return reply
+
+
+def _fallback_extract_content(data: Dict[str, Any]) -> Optional[str]:
+    # รองรับรูปแบบรีสปอนส์ที่ต่างเวอร์ชัน
+    if "message" in data and isinstance(data["message"], dict):
+        return data["message"].get("content")
+    if "messages" in data and isinstance(data["messages"], list) and data["messages"]:
+        last = data["messages"][-1]
+        if isinstance(last, dict):
+            return last.get("content")
+    if "response" in data:
+        return str(data.get("response"))
+    return None
+
+
+# ─── Core: Call Ollama ────────────────────────────────────────────────────────
 async def ask_ollama(prompt: str, user_id: Optional[str] = None) -> str:
     """
-    เรียก Ollama /api/chat (Ollama >= 0.1x รองรับ) แบบ non-stream
+    เรียก Ollama /api/chat แบบ non-stream
     """
     url = f"{OLLAMA_API_URL}/api/chat"
-    system_prompt = (
-      "คุณคือผู้ช่วย AI สำหรับ LINE OA พูดคุยเป็นภาษาไทยเท่านั้น "
-    "ตอบอย่างกวนๆ ฮาๆ เหมือนเป็นเพื่อนกัน"
-    "ถ้าผู้ใช้ถาม ให้ตอบลงท้ายด้วย จร้าาาาา"
-    )
 
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
-            {"role": "system", "content": system_prompt},
-            # สามารถแทรก user-specific context ผ่าน user_id ได้ถ้าต้องการในอนาคต
+            {"role": "system", "content": PROMPT_SYSTEM},
             {"role": "user", "content": prompt},
         ],
         "stream": False,
-        # เผื่ออนาคต: "options": {"temperature": 0.3}
+        "options": {
+            # จำกัดการเดาคำถัดไป (ใกล้เคียง max_tokens)
+            "num_predict": MAX_TOKENS,
+            # ลดความฟุ้ง/ความสุ่ม เพื่อให้ทำตามสไตล์มากขึ้น
+            "temperature": 0.3,
+            "top_p": 0.9,
+        },
     }
 
     timeout = httpx.Timeout(30.0, connect=10.0)
@@ -69,30 +118,20 @@ async def ask_ollama(prompt: str, user_id: Optional[str] = None) -> str:
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
         except httpx.HTTPError as e:
-            print(f"❌ Ollama error: {e}")
-            return "ขออภัย ระบบ AI ตอบไม่ได้ชั่วคราว ลองอีกครั้งได้ไหมคะ"
+            print(f"❌ Ollama HTTP error: {e}")
+            return "ขออภัย ระบบ AI ตอบไม่ได้ชั่วคราว ลองอีกครั้งได้ไหมคะ จร้าาาาา"
 
-    data = resp.json()
-    # รูปแบบตอบกลับของ /api/chat: {"message":{"role":"assistant","content":"..."},"done":true,...}
-    content = (
-        (data.get("message") or {}).get("content")
-        or _fallback_extract_content(data)
-        or "ขออภัย ไม่พบคำตอบที่เหมาะสมค่ะ"
-    )
-    return content.strip()
+    try:
+        data = resp.json()
+    except Exception as e:
+        print(f"❌ Ollama JSON parse error: {e} / body={resp.text[:300]}")
+        return "ขออภัย ระบบ AI ตอบมีปัญหาในการประมวลผล จร้าาาาา"
 
-
-def _fallback_extract_content(data: Dict[str, Any]) -> Optional[str]:
-    # เผื่อบางเวอร์ชัน/รีสปอนส์ มีฟิลด์อื่น
-    if "messages" in data and isinstance(data["messages"], list) and data["messages"]:
-        last = data["messages"][-1]
-        return last.get("content")
-    if "response" in data:
-        return data.get("response")
-    return None
+    content = _fallback_extract_content(data) or "ขออภัย ไม่พบคำตอบที่เหมาะสมค่ะ"
+    return _postprocess_thai(content)
 
 
-# ─── Utils: Reply to LINE ─────────────────────────────────────────────────────
+# ─── LINE Reply ───────────────────────────────────────────────────────────────
 async def reply_to_line(reply_token: str, text: str) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
@@ -107,12 +146,10 @@ async def reply_to_line(reply_token: str, text: str) -> None:
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(url, headers=headers, json=body)
         if resp.status_code != 200:
-            # Log ไว้ดูบน Render
             print(f"❌ LINE reply error {resp.status_code}: {resp.text}")
-            # ไม่ raise เพื่อให้ webhook ตอบ 200 ให้ LINE ไม่ต้อง retry ยาว
 
 
-# ─── Webhook Endpoint ─────────────────────────────────────────────────────────
+# ─── Webhook ──────────────────────────────────────────────────────────────────
 @app.post("/callback")
 async def line_callback(
     request: Request,
@@ -123,7 +160,7 @@ async def line_callback(
 
     body_bytes = await request.body()
 
-    # ตรวจสอบลายเซ็น
+    # ตรวจสอบลายเซ็นจาก LINE
     if not x_line_signature or not verify_line_signature(body_bytes, x_line_signature, LINE_CHANNEL_SECRET):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
@@ -133,36 +170,36 @@ async def line_callback(
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     events: List[Dict[str, Any]] = payload.get("events", [])
-    # รองรับหลาย event ในครั้งเดียว
+
     for event in events:
         etype = event.get("type")
         reply_token = event.get("replyToken")
         source = event.get("source", {})
         user_id = source.get("userId")
 
-        # รับเฉพาะข้อความ
+        # ข้อความปกติ
         if etype == "message" and event.get("message", {}).get("type") == "text":
-            user_text = event["message"]["text"].strip()
+            user_text = (event["message"]["text"] or "").strip()
 
-            # เคสง่าย ๆ: คำสั่งเช็คสถานะ
-            if user_text in ("ping", "health", "status", "เช็คบอท"):
-                await reply_to_line(reply_token, "บอทยังทำงานปกติดีค่ะ ✅")
+            # คำสั่งง่าย ๆ สำหรับตรวจสถานะ
+            if user_text.lower() in {"ping", "health", "status", "เช็คบอท"}:
+                await reply_to_line(reply_token, "บอทยังทำงานปกติดีค่ะ ✅ จร้าาาาา")
                 continue
 
-            # เรียก Ollama
+            # ส่งไปให้ Ollama
             ai_reply = await ask_ollama(user_text, user_id=user_id)
             await reply_to_line(reply_token, ai_reply)
 
-        # กรณีอื่น ๆ (join / follow / postback ฯลฯ) — ตอบสั้น ๆ
-        elif etype in ("follow", "join"):
-            await reply_to_line(reply_token, "สวัสดีค่ะ พิมพ์คำถามมาได้เลยนะคะ 🤖")
+        # กรณี follow / join
+        elif etype in {"follow", "join"}:
+            await reply_to_line(reply_token, "สวัสดีค่า พิมพ์คำถามมาได้เลย จร้าาาาา")
+
+        # เงียบสำหรับ event อื่น ๆ
         else:
-            # เงียบไว้เพื่อไม่ให้วงจรตอบกลับไม่จำเป็น
             pass
 
-    # LINE ต้องการ 200 ภายใน ~1 วินาที
     return {"ok": True}
-    
+
 
 # ─── Local run (Render ใช้ start command เอง) ────────────────────────────────
 if __name__ == "__main__":
@@ -170,4 +207,3 @@ if __name__ == "__main__":
 
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
-
