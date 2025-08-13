@@ -260,20 +260,48 @@ async def ask_ollama(user_text: str) -> str:
         content = "ขออภัย ไม่พบคำตอบที่เหมาะสมค่ะ"
     return _postprocess(content)
 
-# ── Snapshot helper ───────────────────────────────────────────────────────────
+# ── Snapshot helper (รองรับหลายรูปแบบ + URL-encode) ───────────────────────
 async def get_snapshot_image_url(target_url: str) -> Optional[str]:
     if not SNAPSHOT_API:
         return None
-    query_url = f"{SNAPSHOT_API}{target_url}"
+
+    from urllib.parse import quote_plus
+
+    # แนะนำเพิ่มพารามิเตอร์ minimal view ให้ Looker เสถียรขึ้น
+    if "lookerstudio.google.com" in target_url and "rm=" not in target_url:
+        sep = "&" if "?" in target_url else "?"
+        target_url = f"{target_url}{sep}rm=minimal"
+
+    encoded = quote_plus(target_url)
+
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.get(query_url)
+            api = SNAPSHOT_API
+
+            # กรณีที่ตั้ง SNAPSHOT_API เป็น template เช่น:
+            # "https://snap.run/snapshot?url={url}" หรือ ".../snapshot/{url}"
+            if "{url}" in api:
+                url = api.replace("{url}", encoded)
+                r = await client.get(url)
+
+            # ถ้า SNAPSHOT_API มี '?' แล้ว ให้ต่อ encoded ตรง ๆ (เหมือนที่คุณตั้งเป็น ...?url=)
+            elif "?" in api:
+                url = f"{api}{encoded}"
+                r = await client.get(url)
+
+            # ไม่งั้น fallback เป็น POST JSON {"url": "..."}
+            else:
+                r = await client.post(api, json={"url": target_url})
+
             r.raise_for_status()
             data = r.json()
-            return data.get("image_url")
+            # คาดหวัง {"image_url": "https://...png"} หรือ {"url": "..."}
+            return data.get("image_url") or data.get("url")
+
     except Exception as e:
         print(f"❌ Snapshot error: {e}")
         return None
+
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 @app.post("/callback")
@@ -324,7 +352,7 @@ async def line_callback(request: Request, x_line_signature: str = Header(None)):
                 continue
 
             if user_text == "เมนู:อื่นๆ":
-                await reply_text_with_quickreply(reply_token, _postprocess("เมนูเสริม (ไม่แตะฐานข้อมูล)"), submenu_others_items())
+                await reply_text_with_quickreply(reply_token, _postprocess("เมนูเสริม"), submenu_others_items())
                 continue
 
             # ── Leaf actions (static replies) ─────────────────────────────
@@ -386,3 +414,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
