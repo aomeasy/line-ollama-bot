@@ -1,4 +1,4 @@
-# main.py
+# main.py (fixed quick-reply label <= 20 chars)
 import base64
 import hashlib
 import hmac
@@ -18,7 +18,6 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
-# กติกาหลัก (สั้น กระชับ สุภาพ ไทย และลงท้าย "งับ")
 PROMPT_BASE = os.getenv(
     "PROMPT_SYSTEM",
     (
@@ -31,13 +30,13 @@ PROMPT_BASE = os.getenv(
 )
 
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "350"))
-SNAPSHOT_API = os.getenv("SNAPSHOT_API", "").rstrip("/")  # e.g. https://snap.run/snapshot?url=
+SNAPSHOT_API = os.getenv("SNAPSHOT_API", "").rstrip("/")
 
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
     print("⚠️ Missing LINE env: LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="LINE Internal Dashboard Bot", version="1.0.0")
+app = FastAPI(title="LINE Internal Dashboard Bot", version="1.0.1")
 
 @app.get("/healthz")
 async def healthz():
@@ -80,11 +79,24 @@ def _postprocess(reply: str) -> str:
         reply = reply.rstrip("!?. \n\r\t") + " งับ"
     return reply
 
-# ── Helpers: LINE replies ────────────────────────────────────────────────────
+# ── Helpers: labels, replies ─────────────────────────────────────────────────
+def safe_label(label: str, limit: int = 20) -> str:
+    """LINE quick-reply label must be <= 20 chars."""
+    if len(label) <= limit:
+        return label
+    return label[: limit - 1] + "…"
+
 def quick_reply_items(labels_texts: List[Dict[str, str]]) -> Dict[str, Any]:
     return {
         "items": [
-            {"type": "action", "action": {"type": "message", "label": it["label"], "text": it["text"]}}
+            {
+                "type": "action",
+                "action": {
+                    "type": "message",
+                    "label": safe_label(it["label"]),
+                    "text": it["text"],
+                },
+            }
             for it in labels_texts
         ]
     }
@@ -125,7 +137,6 @@ async def reply_image_with_quickreply(reply_token: str, original_url: str, previ
             print(f"❌ LINE reply image error {r.status_code}: {r.text}")
 
 async def reply_sticker(reply_token: str, package_id: str = "11537", sticker_id: str = "52002734"):
-    # สติ๊กเกอร์ (มักเป็น animated) เพื่อสร้างความรู้สึก "animate" ตอนทักทาย
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {"replyToken": reply_token, "messages": [{"type": "sticker", "packageId": package_id, "stickerId": sticker_id}]}
@@ -134,23 +145,22 @@ async def reply_sticker(reply_token: str, package_id: str = "11537", sticker_id:
         if r.status_code != 200:
             print(f"❌ LINE reply sticker error {r.status_code}: {r.text}")
 
-# ── Always-attach Quick Reply (เมนูหลัก) ─────────────────────────────────────
+# ── Menus ─────────────────────────────────────────────────────────────────────
 def main_quick_items() -> List[Dict[str, str]]:
     return [
-        {"label": "📊 คุณภาพบริการ รบ.", "text": "เมนู:คุณภาพบริการ"},
-        {"label": "🗓️ Broadband Daily Report", "text": "เมนู:BB Daily"},
-        {"label": "🧾 Out task Section C", "text": "เมนู:OutTask"},
-        {"label": "🛠️ OLT ONU", "text": "เมนู:OLT"},
+        {"label": "📊 คุณภาพ รบ.", "text": "เมนู:คุณภาพบริการ"},
+        {"label": "🗓️ BB Daily", "text": "เมนู:BB Daily"},
+        {"label": "🧾 OutTask C", "text": "เมนู:OutTask"},
+        {"label": "🛠️ OLT/ONU", "text": "เมนู:OLT"},
         {"label": "🔀 Switch NT", "text": "เมนู:SwitchNT"},
-        {"label": "🌐 กลุ่มบริการ Broadband", "text": "เมนู:Broadband"},
-        {"label": "🛰️ กลุ่มบริการ Datacom", "text": "เมนู:Datacom"},
+        {"label": "🌐 Broadband", "text": "เมนู:Broadband"},
+        {"label": "🛰️ Datacom", "text": "เมนู:Datacom"},
         {"label": "🧩 อื่น ๆ", "text": "เมนู:อื่นๆ"},
     ]
 
 async def reply_text_with_main_quick(reply_token: str, text: str):
     await reply_text_with_quickreply(reply_token, text, main_quick_items())
 
-# ── Submenus ──────────────────────────────────────────────────────────────────
 def submenu_quality_items() -> List[Dict[str, str]]:
     return [
         {"label": "🏗️ ติดตั้ง", "text": "รายงานการติดตั้ง"},
@@ -162,15 +172,15 @@ def submenu_quality_items() -> List[Dict[str, str]]:
 
 def submenu_bb_daily_items() -> List[Dict[str, str]]:
     return [
-        {"label": "🖼️ TTS → รูป", "text": "BB TTS"},
-        {"label": "🖼️ SCOMS → รูป", "text": "BB SCOMS"},
+        {"label": "🖼️ TTS รูป", "text": "BB TTS"},
+        {"label": "🖼️ SCOMS รูป", "text": "BB SCOMS"},
     ]
 
 def submenu_others_items() -> List[Dict[str, str]]:
     return [
         {"label": "✍️ ร่างสรุปวันนี้", "text": "ร่างสรุปวันนี้"},
-        {"label": "🧠 Q&A ผู้ช่วย AI", "text": "Q&A"},
-        {"label": "📌 Pin ลิงก์สำคัญ", "text": "Pins"},
+        {"label": "🧠 Q&A AI", "text": "Q&A"},
+        {"label": "📌 Pins สำคัญ", "text": "Pins"},
         {"label": "🧪 Mock KPIs", "text": "Mock KPIs"},
     ]
 
@@ -180,7 +190,6 @@ def draft_summary_text() -> str:
     th = timezone(timedelta(hours=7))
     now = datetime.now(th)
     date_txt = now.strftime("%d/%m/%Y")
-    # โครงร่างสั้นๆ เอาไปโพสต์ในไลน์กลุ่มได้ (ไม่มี DB)
     return _postprocess(
         f"สรุปสถานการณ์ประจำวัน {date_txt}\n"
         f"• ภาพรวม: การให้บริการเป็นไปตามปกติ\n"
@@ -189,14 +198,13 @@ def draft_summary_text() -> str:
     )
 
 def mock_kpis_text() -> str:
-    # สุ่มตัวเลขเล็ก ๆ เพื่อเดโม (ไม่ใช่ข้อมูลจริง)
     total = random.randint(120, 260)
     closed = random.randint(int(total*0.6), int(total*0.9))
     sla = round(random.uniform(90.0, 97.5), 1)
     mtta = random.randint(12, 28)
     mttr = round(random.uniform(1.8, 3.2), 1)
     csat = round(random.uniform(4.1, 4.6), 2)
-    top_issue = random.choice(["อินเทอร์เน็ตช้า", "ขัดข้องเฉพาะพื้นที่", "บิล/ชำระเงิน", "ตั้งค่าราวเตอร์"])
+    top_issue = random.choice(["อินเทอร์เน็ตช้า", "ขัดข้องพื้นที่", "บิล/ชำระเงิน", "ตั้งค่าราวเตอร์"])
     return _postprocess(
         "Mock KPIs (เดโม)\n"
         f"• งานรับเข้า: {total} เคส | ปิดแล้ว: {closed}\n"
@@ -210,11 +218,11 @@ def pinned_links_text() -> str:
         "📌 ลิงก์สำคัญ\n"
         "• Looker (TTS): https://lookerstudio.google.com/reporting/b893918e-8fff-4cdb-8847-22273278669a/page/B03KD\n"
         "• Looker (SCOMS): https://lookerstudio.google.com/reporting/b893918e-8fff-4cdb-8847-22273278669a/page/p_m4ex303otd\n"
-        "• แนวทางสื่อสารเหตุขัดข้อง (Template): https://example.com/comm-guide\n"
+        "• แนวทางสื่อสารเหตุขัดข้อง: https://example.com/comm-guide\n"
         "• เกณฑ์ SLA สรุปย่อ: https://example.com/sla-brief"
     )
 
-# ── Ollama chat (Q&A TH, ไม่มี persona) ──────────────────────────────────────
+# ── Ollama chat (Q&A TH, เดี่ยว ๆ) ──────────────────────────────────────────
 async def ask_ollama(user_text: str) -> str:
     url = f"{OLLAMA_API_URL}/api/chat"
     payload = {
@@ -256,7 +264,6 @@ async def ask_ollama(user_text: str) -> str:
 async def get_snapshot_image_url(target_url: str) -> Optional[str]:
     if not SNAPSHOT_API:
         return None
-    # สมมติ SNAPSHOT_API เป็น base ที่ต่อท้ายด้วย URL ได้เลย เช่น https://snap.run/snapshot?url=
     query_url = f"{SNAPSHOT_API}{target_url}"
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -290,7 +297,7 @@ async def line_callback(request: Request, x_line_signature: str = Header(None)):
         if not reply_token:
             continue
 
-        # ทักทายตอน follow/join ด้วยสติ๊กเกอร์ + เมนูหลัก
+        # follow/join: ต้อนรับด้วยสติ๊กเกอร์ + เมนูหลัก
         if etype in {"follow", "join"}:
             await reply_sticker(reply_token)
             await reply_text_with_main_quick(reply_token, _postprocess("สวัสดีค่ะ เลือกเมนูด้านล่างเพื่อเริ่มใช้งานได้เลย"))
@@ -301,13 +308,13 @@ async def line_callback(request: Request, x_line_signature: str = Header(None)):
             user_text = (event["message"]["text"] or "").strip()
             lower = user_text.lower()
 
-            # คำทักทายทั่วไป → ส่งสติ๊กเกอร์ + เมนู
+            # ทักทายทั่วไป → สติ๊กเกอร์ + เมนู
             if lower in {"start", "เริ่ม", "สวัสดี", "hello", "hi"}:
                 await reply_sticker(reply_token)
                 await reply_text_with_main_quick(reply_token, _postprocess("ยินดีช่วยครับ เลือกเมนูด้านล่างได้เลย"))
                 continue
 
-            # ── Show submenus ────────────────────────────────────────────────
+            # ── Submenus ───────────────────────────────────────────────────
             if user_text == "เมนู:คุณภาพบริการ":
                 await reply_text_with_quickreply(reply_token, _postprocess("เลือกหัวข้อคุณภาพบริการ รบ."), submenu_quality_items())
                 continue
@@ -320,15 +327,16 @@ async def line_callback(request: Request, x_line_signature: str = Header(None)):
                 await reply_text_with_quickreply(reply_token, _postprocess("เมนูเสริม (ไม่แตะฐานข้อมูล)"), submenu_others_items())
                 continue
 
-            # ── Leaf actions (static wait replies) ──────────────────────────
+            # ── Leaf actions (static replies) ─────────────────────────────
             if user_text in {
-                "รายงานการติดตั้ง", "รายงานการแก้ไขเหตุเสีย", "เหตุเสียต่อพอร์ท", "อัตราเสียซ้ำ", "SA (Datacom)",
-                "เมนู:OutTask", "เมนู:OLT", "เมนู:SwitchNT", "เมนู:Broadband", "เมนู:Datacom"
+                "รายงานการติดตั้ง", "รายงานการแก้ไขเหตุเสีย", "เหตุเสียต่อพอร์ท",
+                "อัตราเสียซ้ำ", "SA (Datacom)", "เมนู:OutTask", "เมนู:OLT",
+                "เมนู:SwitchNT", "เมนู:Broadband", "เมนู:Datacom"
             }:
                 await reply_text_with_main_quick(reply_token, _postprocess("รอ update แปปงับ"))
                 continue
 
-            # ── Looker snapshots → image into LINE ─────────────────────────
+            # ── Looker snapshots → image ─────────────────────────────────
             if user_text == "BB TTS":
                 tts_url = "https://lookerstudio.google.com/reporting/b893918e-8fff-4cdb-8847-22273278669a/page/B03KD"
                 img = await get_snapshot_image_url(tts_url)
@@ -347,7 +355,7 @@ async def line_callback(request: Request, x_line_signature: str = Header(None)):
                     await reply_text_with_main_quick(reply_token, _postprocess("ยังแคปรูปไม่ได้ (ไม่พบ SNAPSHOT_API) งับ"))
                 continue
 
-            # ── Others submenu actions ─────────────────────────────────────
+            # ── Others submenu actions ───────────────────────────────────
             if user_text == "ร่างสรุปวันนี้":
                 await reply_text_with_main_quick(reply_token, draft_summary_text())
                 continue
@@ -367,7 +375,7 @@ async def line_callback(request: Request, x_line_signature: str = Header(None)):
                 )
                 continue
 
-            # ── Default: ส่งให้ AI ช่วย (ไม่มี persona) ────────────────────
+            # ── Default: ส่งให้ AI ───────────────────────────────────────
             ai_reply = await ask_ollama(user_text)
             await reply_text_with_main_quick(reply_token, ai_reply)
 
